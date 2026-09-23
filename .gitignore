@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.spec
+
+# IDE
+.idea/
+.vscode/
+
+# Generated files
+*.exe
+*.pkg
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.ico
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak

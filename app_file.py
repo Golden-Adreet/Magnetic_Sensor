@@ -10,7 +10,6 @@ import subprocess
 import threading
 import serial
 import serial.tools.list_ports
-#connection 
 ESP_IP = "192.168.29.78"       
 WS_PORT = 81
 WS_URL = f"ws://{ESP_IP}:{WS_PORT}/"
@@ -30,7 +29,6 @@ ws_lock = threading.Lock()
 serial_conn = None
 serial_lock = threading.Lock()
 
-# USB sensor health 
 last_sensor_data_time = 0.0
 sensor_error = None
 USB_DATA_TIMEOUT = 2.0
@@ -43,7 +41,6 @@ start_time = time.time()
 last_graph_update = 0
 notification_start_time = 0
 
-#Magnetic field data
 selected_unit = "G"
 
 UNIT_FACTORS = {
@@ -58,11 +55,15 @@ Bz = 0.0
 
 B_magnitude = 0.0
 
-# Magnetic field controller state
-# The Arduino PID controls Bz. The internal setpoint is stored in Gauss.
 controller_setpoint_g = 0.0
 pid_running = False
 last_reported_error = None
+
+current_kp = None
+current_ki = None
+current_kd = None
+autotune_running = False
+trim_voltage = None
 
 # Calibration bias
 Bx_bias = 0.0
@@ -85,6 +86,8 @@ last_logged_time = 0
 def process_sensor_message(message):
     global Bx, By, Bz, B_magnitude
     global last_sensor_data_time, sensor_error
+    global current_kp, current_ki, current_kd, autotune_running, trim_voltage
+    global pid_running
 
     try:
         if isinstance(message, bytes):
@@ -97,13 +100,13 @@ def process_sensor_message(message):
 
         payload = json.loads(message)
 
-        # Arduino may report recoverable RM3100/I2C errors.
         if "error" in payload:
             sensor_error = str(payload["error"])
             return False
 
-        # Controller status packets are informational, not sensor packets.
+        # Controller status packets (autotune progress/results) are
         if "status" in payload:
+            handle_status_packet(payload)
             return False
 
         if not all(key in payload for key in ("Bx", "By", "Bz")):
@@ -116,16 +119,67 @@ def process_sensor_message(message):
 
         B_magnitude = (Bx**2 + By**2 + Bz**2) ** 0.5
 
+        if "kp" in payload:
+            current_kp = float(payload["kp"])
+        if "ki" in payload:
+            current_ki = float(payload["ki"])
+        if "kd" in payload:
+            current_kd = float(payload["kd"])
+        if "autotuning" in payload:
+            autotune_running = bool(payload["autotuning"])
+        if "pidEnabled" in payload:
+            pid_running = bool(payload["pidEnabled"])
+        if "trimV" in payload:
+            trim_voltage = float(payload["trimV"])
+
         last_sensor_data_time = time.time()
         sensor_error = None
         return True
 
     except (json.JSONDecodeError, TypeError, ValueError):
-        # Ignore Arduino startup text such as "RM3100 Measurement".
         return False
 
 
-#callibration
+def handle_status_packet(payload):
+    global autotune_running, current_kp, current_ki, current_kd
+
+    status = payload.get("status")
+
+    if status == "autotune_started":
+        autotune_running = True
+        show_notification("Autotune running - do not disturb the sensor/coil...")
+        if dpg.does_item_exist("autotune_button"):
+            dpg.set_item_label("autotune_button", "AUTOTUNING...")
+            dpg.disable_item("autotune_button")
+
+    elif status == "autotune_done":
+        autotune_running = False
+        current_kp = float(payload.get("Kp", current_kp or 0))
+        current_ki = float(payload.get("Ki", current_ki or 0))
+        current_kd = float(payload.get("Kd", current_kd or 0))
+
+        if dpg.does_item_exist("kp_input"):
+            dpg.set_value("kp_input", current_kp)
+        if dpg.does_item_exist("ki_input"):
+            dpg.set_value("ki_input", current_ki)
+        if dpg.does_item_exist("kd_input"):
+            dpg.set_value("kd_input", current_kd)
+        if dpg.does_item_exist("autotune_button"):
+            dpg.set_item_label("autotune_button", "AUTOTUNE PID")
+            dpg.enable_item("autotune_button")
+
+        show_notification(
+            f"Autotune done: Kp={current_kp:.4f} Ki={current_ki:.4f} Kd={current_kd:.4f}"
+        )
+
+    elif status == "autotune_failed":
+        autotune_running = False
+        if dpg.does_item_exist("autotune_button"):
+            dpg.set_item_label("autotune_button", "AUTOTUNE PID")
+            dpg.enable_item("autotune_button")
+        show_error("Autotune failed - no sustained oscillation detected")
+
+
 
 def start_calibration():
     global calibrating, calibration_samples
@@ -170,7 +224,6 @@ def finish_calibration():
             values = sorted(values)
             trim = int(len(values) * CALIBRATION_TRIM_PERCENT / 100)
 
-            # Always retain at least one sample.
             if 2 * trim >= len(values):
                 trim = 0
 
@@ -178,7 +231,6 @@ def finish_calibration():
 
             return sum(trimmed) / len(trimmed)
 
-        # Default: arithmetic mean
         return sum(values) / len(values)
 
     Bx_bias = calculate(xs)
@@ -254,7 +306,6 @@ def show_settings_window():
 
         with dpg.tab_bar(tag="settings_tabs"):
 
-            #connection tab
 
             with dpg.tab(label="Connection"):
 
@@ -294,7 +345,6 @@ def show_settings_window():
                     width=120
                 )
 
-            ##callibration tab
 
             with dpg.tab(label="Calibration"):
 
@@ -367,7 +417,173 @@ def show_settings_window():
             )
         )
 
-#Unit conversion
+
+
+def show_advanced_control_window():
+    if dpg.does_item_exist("advanced_control_window"):
+        if dpg.does_item_exist("kp_input"):
+            dpg.set_value("kp_input", current_kp if current_kp is not None else 0.05)
+        if dpg.does_item_exist("ki_input"):
+            dpg.set_value("ki_input", current_ki if current_ki is not None else 0.01)
+        if dpg.does_item_exist("kd_input"):
+            dpg.set_value("kd_input", current_kd if current_kd is not None else 0.0)
+
+        dpg.configure_item(
+            "advanced_control_window",
+            show=True
+        )
+        return
+
+    vp_w = dpg.get_viewport_width()
+    vp_h = dpg.get_viewport_height()
+
+    with dpg.window(
+        label="Advanced Control Settings",
+        modal=True,
+        show=True,
+        tag="advanced_control_window",
+        width=540,
+        height=500,
+        pos=[
+            (vp_w - 540) // 2,
+            (vp_h - 500) // 2
+        ],
+        no_resize=True
+    ):
+
+        dpg.add_text(
+            "ADVANCED CONTROL SETTINGS",
+            color=[100, 220, 255, 255]
+        )
+
+        dpg.add_separator()
+        dpg.add_spacer(height=10)
+
+        with dpg.tab_bar(tag="advanced_control_tabs"):
+
+            with dpg.tab(label="PID GAINS"):
+
+                dpg.add_spacer(height=8)
+
+                dpg.add_text(
+                    "PID GAINS",
+                    color=[120, 205, 235, 255]
+                )
+
+                dpg.add_text(
+                    "These parameters determine how the controller "
+                    "responds to field error."
+                )
+
+                dpg.add_spacer(height=12)
+
+                dpg.add_text("Kp")
+                dpg.add_input_float(
+                    default_value=current_kp if current_kp is not None else 0.05,
+                    width=240,
+                    format="%.6f",
+                    tag="kp_input"
+                )
+
+                dpg.add_spacer(height=7)
+
+                dpg.add_text("Ki")
+                dpg.add_input_float(
+                    default_value=current_ki if current_ki is not None else 0.01,
+                    width=240,
+                    format="%.6f",
+                    tag="ki_input"
+                )
+
+                dpg.add_spacer(height=7)
+
+                dpg.add_text("Kd")
+                dpg.add_input_float(
+                    default_value=current_kd if current_kd is not None else 0.0,
+                    width=240,
+                    format="%.6f",
+                    tag="kd_input"
+                )
+
+                dpg.add_spacer(height=12)
+
+                dpg.add_button(
+                    label="APPLY PID GAINS",
+                    width=240,
+                    callback=apply_gains
+                )
+
+            with dpg.tab(label="AUTOTUNE"):
+
+                dpg.add_spacer(height=8)
+
+                dpg.add_text(
+                    "RELAY-FEEDBACK AUTOTUNE",
+                    color=[120, 205, 235, 255]
+                )
+
+                dpg.add_text(
+                    "Autotune temporarily changes the DAC output around "
+                    "a center voltage. The resulting field oscillation is "
+                    "used by the controller to estimate PID gains."
+                )
+
+                dpg.add_spacer(height=12)
+
+                dpg.add_text("Relay center")
+                dpg.add_input_float(
+                    default_value=5.0,
+                    width=240,
+                    format="%.2f",
+                    tag="at_center_input"
+                )
+
+                dpg.add_text(
+                    "Middle DAC output voltage."
+                )
+
+                dpg.add_spacer(height=8)
+
+                dpg.add_text("Relay amplitude")
+                dpg.add_input_float(
+                    default_value=2.0,
+                    width=240,
+                    format="%.2f",
+                    tag="at_amp_input"
+                )
+
+                dpg.add_text(
+                    "Half of the DAC swing. Example: 5 V ± 2 V = 3 V / 7 V."
+                )
+
+                dpg.add_spacer(height=14)
+
+                dpg.add_button(
+                    label="RUN AUTOTUNE",
+                    width=240,
+                    tag="autotune_button",
+                    callback=run_autotune
+                )
+
+                dpg.add_spacer(height=8)
+
+                dpg.add_text(
+                    "Keep the sensor and coil undisturbed while autotune runs.",
+                    wrap=430,
+                    color=[180, 180, 180, 255]
+                )
+
+        dpg.add_spacer(height=15)
+
+        dpg.add_button(
+            label="Close",
+            width=100,
+            callback=lambda: dpg.configure_item(
+                "advanced_control_window",
+                show=False
+            )
+        )
+
 
 def convert_from_gauss(value):
     return value * UNIT_FACTORS[selected_unit]
@@ -375,13 +591,11 @@ def convert_from_gauss(value):
 def change_layout(sender, app_data):
     if app_data == "All":
 
-        # Show all containers
         dpg.configure_item("bx_container", show=True, width=450, height=275)
         dpg.configure_item("by_container", show=True, width=450, height=275)
         dpg.configure_item("bz_container", show=True, width=450, height=275)
         dpg.configure_item("bmag_container", show=True, width=450, height=275)
 
-        # Restore plot sizes
         dpg.configure_item("bx_plot", width=-1, height=245)
         dpg.configure_item("by_plot", width=-1, height=245)
         dpg.configure_item("bz_plot", width=-1, height=245)
@@ -429,7 +643,6 @@ def change_unit(sender, app_data):
 
     factor = UNIT_FACTORS[selected_unit]
 
-    # Keep the controller setpoint physically unchanged when display units change.
     if dpg.does_item_exist("setpoint_input"):
         dpg.set_value("setpoint_input", controller_setpoint_g * factor)
 
@@ -439,7 +652,6 @@ def change_unit(sender, app_data):
             f"Target: {controller_setpoint_g * factor:.4f} {selected_unit}"
         )
 
-    # Top values
     dpg.set_value(
         "bx_text",
         f"Bx : {Bx * factor:.4f} {selected_unit}"
@@ -460,7 +672,6 @@ def change_unit(sender, app_data):
         f"|B| : {B_magnitude * factor:.4f} {selected_unit}"
     )
 
-    # Graph Y-axis labels
     dpg.configure_item(
         "bx_y_axis",
         label=f"Bx ({selected_unit})"
@@ -494,7 +705,6 @@ def update_unit_display():
                   f"|B| : {B_magnitude * factor:.4f} {selected_unit}")
 
 def on_ws_message(websocket_app, message):
-    # Ignore WebSocket data while USB is the active mode
     if connection_mode != MODE_WEBSOCKET:
         return
 
@@ -580,7 +790,6 @@ def retry_connection():
     show_notification("Reconnecting...")
 
 
-#USB Serial
 
 def find_arduino_port():
 
@@ -594,7 +803,6 @@ def find_arduino_port():
             f"{port.hwid or ''}"
         ).upper()
 
-        # Ignore Bluetooth virtual serial ports
         if "BLUETOOTH" in text:
             continue
 
@@ -629,7 +837,6 @@ def usb_reader(port):
                 timeout=0.2
             )
 
-            # Arduino Mega resets when the serial port opens.
             time.sleep(2)
 
             with serial_lock:
@@ -648,8 +855,6 @@ def usb_reader(port):
                         if valid:
                             is_connected = True
 
-                    # If no valid RM3100 packet arrives for too long,
-                    # close the port and reconnect.
                     if (
                         is_connected
                         and time.time() - last_sensor_data_time > USB_DATA_TIMEOUT
@@ -697,7 +902,6 @@ def switch_to_usb():
     if not port:
         return
 
-    # Stop WebSocket
     with ws_lock:
         active_ws = ws
 
@@ -741,7 +945,6 @@ def usb_monitor():
 
         current_port = find_arduino_port()
 
-        # Arduino inserted
         if current_port is not None and previous_port is None:
 
             usb_candidate_port = current_port
@@ -750,7 +953,6 @@ def usb_monitor():
                 if current_port != usb_declined_port:
                     usb_prompt_shown = False
 
-        # Arduino removed
         if current_port is None and previous_port is not None:
 
             if connection_mode == MODE_USB:
@@ -776,7 +978,6 @@ def usb_monitor():
 
         time.sleep(1)
 
-#connection Manager
 
 def apply_connection():
     global ESP_IP, WS_PORT, WS_URL
@@ -795,7 +996,6 @@ def show_networks_popup():
     show_settings_window()
 
 
-#USB prompt
 
 def show_usb_prompt():
     global usb_prompt_shown
@@ -877,54 +1077,45 @@ def show_usb_prompt():
     )
 
 
-# ============================================================================
-# MAGNETIC FIELD CONTROLLER COMMUNICATION
-# ============================================================================
 
 def send_controller_command(command):
-    # Direct USB communication is implemented now.
-    # WebSocket control can be added later when the ESP8266 forwards commands.
-    if connection_mode != MODE_USB:
-        show_error("Controller commands currently require USB connection")
-        return False
+    if connection_mode == MODE_WEBSOCKET:
+        with ws_lock:
+            active_ws = ws
 
-    with serial_lock:
-        ser = serial_conn
+        if active_ws is None:
+            show_error("WebSocket is not connected")
+            return False
 
-    if ser is None or not ser.is_open:
-        show_error("Arduino serial connection is not available")
-        return False
+        try:
+            active_ws.send(command)
+            return True
+        except Exception as error:
+            show_error(f"Command failed: {error}")
+            return False
 
-    try:
+    elif connection_mode == MODE_USB:
         with serial_lock:
-            ser.write((command + "\n").encode("utf-8"))
-            ser.flush()
-        return True
-    except (serial.SerialException, OSError) as error:
-        show_error(f"Command failed: {error}")
-        return False
+            ser = serial_conn
+
+        if ser is None or not ser.is_open:
+            show_error("Arduino serial connection is not available")
+            return False
+
+        try:
+            with serial_lock:
+                ser.write((command + "\n").encode("utf-8"))
+                ser.flush()
+            return True
+        except (serial.SerialException, OSError) as error:
+            show_error(f"Command failed: {error}")
+            return False
+
+    show_error("No active connection")
+    return False
 
 
 def apply_setpoint(sender=None, app_data=None, user_data=None):
-    global controller_setpoint_g
-
-    try:
-        value_in_display_units = float(dpg.get_value("setpoint_input"))
-    except (TypeError, ValueError):
-        show_error("Invalid setpoint")
-        return
-
-    controller_setpoint_g = value_in_display_units / UNIT_FACTORS[selected_unit]
-
-    if send_controller_command(f"SET {controller_setpoint_g:.6f}"):
-        dpg.set_value(
-            "setpoint_status",
-            f"Target: {value_in_display_units:.4f} {selected_unit}"
-        )
-        show_notification("Setpoint sent")
-
-
-def start_pid(sender=None, app_data=None, user_data=None):
     global controller_setpoint_g, pid_running
 
     try:
@@ -935,25 +1126,61 @@ def start_pid(sender=None, app_data=None, user_data=None):
 
     controller_setpoint_g = value_in_display_units / UNIT_FACTORS[selected_unit]
 
-    if not send_controller_command(f"SET {controller_setpoint_g:.6f}"):
+    if not send_controller_command(f"SETPOINT {controller_setpoint_g:.6f}"):
         return
 
-    if send_controller_command("START"):
+    if send_controller_command("PID_ON"):
         pid_running = True
-        dpg.set_value("pid_status", "PID: RUNNING")
-        show_notification("PID started")
+        dpg.set_value(
+            "setpoint_status",
+            f"Target: {value_in_display_units:.4f} {selected_unit}"
+        )
+        show_notification("Setpoint applied")
 
 
-def stop_pid(sender=None, app_data=None, user_data=None):
-    global pid_running
+def apply_gains(sender=None, app_data=None, user_data=None):
+    """Push Kp/Ki/Kd from the GUI to the device. Each gain is sent as a
+    separate command because that's what the firmware's handleCommand()
+    parses (KP <v>, KI <v>, KD <v>)."""
+    try:
+        kp = float(dpg.get_value("kp_input"))
+        ki = float(dpg.get_value("ki_input"))
+        kd = float(dpg.get_value("kd_input"))
+    except (TypeError, ValueError):
+        show_error("Invalid PID gain")
+        return
 
-    if send_controller_command("STOP"):
-        pid_running = False
-        dpg.set_value("pid_status", "PID: STOPPED")
-        show_notification("PID stopped")
+    ok = (
+        send_controller_command(f"KP {kp:.6f}")
+        and send_controller_command(f"KI {ki:.6f}")
+        and send_controller_command(f"KD {kd:.6f}")
+    )
+
+    if ok:
+        show_notification(f"Gains applied: Kp={kp:.4f} Ki={ki:.4f} Kd={kd:.4f}")
 
 
-# Notification / error toast
+def run_autotune(sender=None, app_data=None, user_data=None):
+    """Relay-feedback autotune. Runs on the device (see AUTOTUNE command in
+    firmware); GUI just triggers it and waits for the autotune_done status
+    packet (handled in handle_status_packet) to refresh the gain fields."""
+    if not is_connected:
+        show_notification("Connect to the device before autotuning")
+        return
+
+    try:
+        center = float(dpg.get_value("at_center_input"))
+        amp = float(dpg.get_value("at_amp_input"))
+    except (TypeError, ValueError):
+        show_error("Invalid autotune center/amplitude")
+        return
+
+    if amp <= 0 or center - amp < 0 or center + amp > 10:
+        show_error("Autotune swing must stay within the 0-10V DAC range")
+        return
+
+    send_controller_command(f"AUTOTUNE {center:.4f} {amp:.4f}")
+
 
 def show_toast(message, is_error=False):
 
@@ -968,7 +1195,6 @@ def show_toast(message, is_error=False):
         color=[255, 100, 100, 255] if is_error else [220, 220, 220, 255]
     )
 
-    # Small notification in the top-right corner.
     vp_w = dpg.get_viewport_width()
     popup_width = 330
     margin = 20
@@ -989,7 +1215,6 @@ def show_notification(message):
 def show_error(message):
     show_toast(f"ERROR: {message}", is_error=True)
 
-#Excel logging
 
 def export_excel():
 
@@ -1044,17 +1269,53 @@ def toggle_logging():
         show_notification("Logging Stopped")
 
 
-#GUI
 
 dpg.create_context()
+
+
+def setup_theme():
+    with dpg.theme() as theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_WindowBg, [12, 16, 24, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, [17, 22, 32, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_PopupBg, [20, 26, 38, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Border, [48, 60, 78, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, [25, 32, 45, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, [32, 43, 60, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, [38, 52, 72, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Button, [28, 75, 105, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, [38, 105, 145, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, [25, 125, 170, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Header, [24, 62, 88, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, [35, 90, 120, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, [40, 110, 145, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Text, [225, 232, 240, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_TextDisabled, [120, 130, 145, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Tab, [20, 29, 42, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_TabHovered, [30, 82, 112, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_TabActive, [26, 72, 100, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Separator, [48, 64, 82, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_CheckMark, [80, 200, 240, 255])
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 7)
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 9)
+            dpg.add_theme_style(dpg.mvStyleVar_PopupRounding, 9)
+            dpg.add_theme_style(dpg.mvStyleVar_GrabRounding, 7)
+            dpg.add_theme_style(dpg.mvStyleVar_TabRounding, 7)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 8, 6)
+            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 7)
+            dpg.add_theme_style(dpg.mvStyleVar_CellPadding, 7, 5)
+    dpg.bind_theme(theme)
+
+setup_theme()
+
 
 large_icon = "D:/Code files pycharm/Masters/magnetic_sensor/adreet_sarkar_app_icon_large.ico"
 small_icon = "D:/Code files pycharm/Masters/magnetic_sensor/adreet_sarkar_app_icon.ico"
 
 dpg.create_viewport(
-    title="RM3100 Magnetic Field Monitor",
-    width=1400,
-    height=900,
+    title="RM3100 Magnetic Field Monitor  |  Precision Field Control",
+    width=1500,
+    height=920,
     large_icon=large_icon,
     small_icon=small_icon
 )
@@ -1071,11 +1332,10 @@ bmag_data = deque(maxlen=max_points)
 notification_start_time = 0
 
 
-with dpg.window(tag="Primary Window"):
+with dpg.window(tag="Primary Window", no_title_bar=True, no_resize=True, no_move=True, no_scrollbar=True):
 
     dpg.add_spacer(height=10)
 
-    ##Header
 
     with dpg.table(
         header_row=False,
@@ -1093,7 +1353,7 @@ with dpg.window(tag="Primary Window"):
 
         with dpg.table_row():
 
-            dpg.add_text("RM3100 MAGNETIC FIELD MONITOR")
+            dpg.add_text("RM3100  |  MAGNETIC FIELD MONITOR", color=[100, 220, 255, 255])
 
             with dpg.group(horizontal=True):
 
@@ -1125,39 +1385,41 @@ with dpg.window(tag="Primary Window"):
     dpg.add_separator()
     dpg.add_spacer(height=10)
 
-    #Field Values
 
     with dpg.group(horizontal=True):
 
         dpg.add_text(
-            "Bx : 0.0000 G",
-            tag="bx_text"
+            "Bx  0.0000 G",
+            tag="bx_text",
+            color=[95, 190, 255, 255]
         )
 
         dpg.add_spacer(width=50)
 
         dpg.add_text(
-            "By : 0.0000 G",
-            tag="by_text"
+            "By  0.0000 G",
+            tag="by_text",
+            color=[110, 220, 180, 255]
         )
 
         dpg.add_spacer(width=50)
 
         dpg.add_text(
-            "Bz : 0.0000 G",
-            tag="bz_text"
+            "Bz  0.0000 G",
+            tag="bz_text",
+            color=[255, 190, 90, 255]
         )
 
         dpg.add_spacer(width=50)
 
         dpg.add_text(
-            "|B| : 0.0000 G",
-            tag="bmag_text"
+            "|B|  0.0000 G",
+            tag="bmag_text",
+            color=[210, 150, 255, 255]
         )
 
     dpg.add_spacer(height=20)
 
-    #Main Area
 
     with dpg.table(
         header_row=False,
@@ -1176,148 +1438,229 @@ with dpg.window(tag="Primary Window"):
 
         with dpg.table_row():
 
-            #control panel
 
             with dpg.child_window(
                 border=True,
-                height=700
+                height=600,
+                no_scrollbar=True
             ):
 
-                dpg.add_text("CONTROL PANEL")
-
-                dpg.add_separator()
-                dpg.add_spacer(height=15)
-
-                dpg.add_text("Connection Mode")
-
                 dpg.add_text(
-                    "WebSocket",
-                    tag="mode_text"
+                    "CONTROL PANEL",
+                    color=[100, 220, 255, 255]
                 )
 
-                dpg.add_spacer(height=20)
-
-                # Magnetic field PID controller
-                dpg.add_text("MAGNETIC FIELD CONTROL")
                 dpg.add_separator()
                 dpg.add_spacer(height=8)
 
-                dpg.add_text("Bz Setpoint")
-                dpg.add_input_float(
-                    default_value=0.0,
-                    width=200,
-                    format="%.4f",
-                    tag="setpoint_input",
-                    on_enter=True,
-                    callback=apply_setpoint
-                )
-
                 dpg.add_text(
-                    "Target: 0.0000 G",
-                    tag="setpoint_status"
+                    "Connection",
+                    color=[150, 165, 185, 255]
                 )
-
-                dpg.add_spacer(height=6)
-
-                dpg.add_button(
-                    label="APPLY SETPOINT",
-                    width=200,
-                    callback=apply_setpoint
-                )
-
-                dpg.add_spacer(height=8)
 
                 with dpg.group(horizontal=True):
-                    dpg.add_button(
-                        label="START PID",
-                        width=95,
-                        callback=start_pid
-                    )
-                    dpg.add_button(
-                        label="STOP PID",
-                        width=95,
-                        callback=stop_pid
+                    dpg.add_text(
+                        "●",
+                        tag="control_conn_dot",
+                        color=[255, 80, 80, 255]
                     )
 
-                dpg.add_text(
-                    "PID: STOPPED",
-                    tag="pid_status",
-                    color=[180, 180, 180, 255]
-                )
+                    dpg.add_text(
+                        "WebSocket",
+                        tag="mode_text"
+                    )
 
-                dpg.add_spacer(height=20)
+                dpg.add_spacer(height=8)
 
-                dpg.add_button(
-                    label="START LOGGING",
-                    width=200,
-                    callback=toggle_logging,
-                    tag="logging_button"
-                )
+                with dpg.tab_bar(tag="control_tabs"):
 
-                dpg.add_spacer(height=10)
+                    with dpg.tab(label="CONTROL"):
 
-                dpg.add_button(
-                    label="Export Excel",
-                    width=200,
-                    callback=export_excel,
-                    tag="export_button"
-                )
+                        dpg.add_spacer(height=8)
 
-                dpg.add_spacer(height=25)
+                        dpg.add_text(
+                            "MAGNETIC FIELD CONTROL",
+                            color=[120, 205, 235, 255]
+                        )
 
-                dpg.add_text("Logging Interval")
+                        dpg.add_separator()
+                        dpg.add_spacer(height=8)
 
-                dpg.add_input_int(
-                    label="Seconds",
-                    default_value=1,
-                    width=150,
-                    tag="logging_interval"
-                )
+                        dpg.add_text("Bz Setpoint")
 
-                dpg.add_text("Display Units")
+                        dpg.add_input_float(
+                            default_value=0.0,
+                            width=230,
+                            format="%.4f",
+                            tag="setpoint_input",
+                            on_enter=True,
+                            callback=apply_setpoint
+                        )
 
-                dpg.add_combo(
-                    items=["G", "mG", "uT", "mT"],
-                    default_value="G",
-                    width=150,
-                    tag="unit_combo",
-                    callback=change_unit
-                )
-                dpg.add_text("Layout")
+                        dpg.add_text(
+                            "Target: 0.0000 G",
+                            tag="setpoint_status"
+                        )
 
-                dpg.add_combo(
-                    items=["All", "Bx", "By", "Bz", "Mag"],
-                    default_value="All",
-                    width=150,
-                    tag="layout_combo",
-                    callback=change_layout
-                )
+                        dpg.add_spacer(height=6)
 
-                dpg.add_spacer(height=20)
+                        dpg.add_button(
+                            label="APPLY SETPOINT",
+                            width=230,
+                            callback=apply_setpoint
+                        )
 
-                dpg.add_text("Sensor Calibration")
+                        dpg.add_spacer(height=16)
 
-                dpg.add_button(
-                    label="CALIBRATE ZERO",
-                    width=200,
-                    tag="calibrate_button",
-                    callback=start_calibration
-                )
+                        dpg.add_text(
+                            "ADVANCED CONTROL",
+                            color=[120, 205, 235, 255]
+                        )
 
-                dpg.add_text(
-                    "Bias: 0.0000 G",
-                    tag="bias_text"
-                )
+                        dpg.add_separator()
+                        dpg.add_spacer(height=8)
+
+                        dpg.add_button(
+                            label="PID & AUTOTUNE SETTINGS",
+                            width=230,
+                            tag="advanced_control_button",
+                            callback=show_advanced_control_window
+                        )
+
+                        dpg.add_spacer(height=8)
+
+                        dpg.add_text(
+                            "PID is enabled automatically when a setpoint is applied.",
+                            wrap=240,
+                            color=[170, 180, 195, 255]
+                        )
+
+                        dpg.add_spacer(height=15)
+
+                        dpg.add_text(
+                            "GRAPH DISPLAY",
+                            color=[120, 205, 235, 255]
+                        )
+
+                        dpg.add_separator()
+                        dpg.add_spacer(height=8)
+
+                        dpg.add_text("Graph Layout")
+
+                        dpg.add_combo(
+                            items=["All", "Bx", "By", "Bz", "Mag"],
+                            default_value="All",
+                            width=230,
+                            tag="layout_combo",
+                            callback=change_layout
+                        )
+
+                        dpg.add_spacer(height=10)
+
+                        dpg.add_text("Display Units")
+
+                        dpg.add_combo(
+                            items=["G", "mG", "uT", "mT"],
+                            default_value="G",
+                            width=230,
+                            tag="unit_combo",
+                            callback=change_unit
+                        )
+
+                        dpg.add_spacer(height=8)
+
+                    with dpg.tab(label="LOGGING"):
+
+                        dpg.add_spacer(height=8)
+
+                        dpg.add_text(
+                            "DATA LOGGING",
+                            color=[120, 205, 235, 255]
+                        )
+
+                        dpg.add_separator()
+                        dpg.add_spacer(height=8)
+
+                        dpg.add_button(
+                            label="START LOGGING",
+                            width=230,
+                            callback=toggle_logging,
+                            tag="logging_button"
+                        )
+
+                        dpg.add_spacer(height=7)
+
+                        dpg.add_button(
+                            label="Export Excel",
+                            width=230,
+                            callback=export_excel,
+                            tag="export_button"
+                        )
+
+                        dpg.add_spacer(height=15)
+
+                        dpg.add_text("Logging Interval")
+
+                        dpg.add_input_int(
+                            label="Seconds",
+                            default_value=1,
+                            width=180,
+                            tag="logging_interval"
+                        )
+
+                        dpg.add_spacer(height=10)
 
 
-            #Graph
+                    with dpg.tab(label="CALIBRATION"):
+
+                        dpg.add_spacer(height=8)
+
+                        dpg.add_text(
+                            "SENSOR CALIBRATION",
+                            color=[120, 205, 235, 255]
+                        )
+
+                        dpg.add_separator()
+                        dpg.add_spacer(height=8)
+
+                        dpg.add_button(
+                            label="CALIBRATE ZERO",
+                            width=230,
+                            tag="calibrate_button",
+                            callback=start_calibration
+                        )
+
+                        dpg.add_spacer(height=8)
+
+                        dpg.add_text(
+                            "Bias: 0.0000 G",
+                            tag="bias_text"
+                        )
+
+                        dpg.add_spacer(height=15)
+
+                        dpg.add_text(
+                            "Physical trim: -- V",
+                            tag="trim_text"
+                        )
+
+                        dpg.add_spacer(height=15)
+
+                        dpg.add_text(
+                            "Calibration configuration is available "
+                            "from Settings.",
+                            wrap=240,
+                            color=[180, 180, 180, 255]
+                        )
+
 
             with dpg.child_window(
                 border=True,
-                height=640
+                height=600,
+                no_scrollbar=True
             ):
 
-                dpg.add_text("LIVE MAGNETIC FIELD")
+                dpg.add_text("LIVE MAGNETIC FIELD", color=[100, 220, 255, 255])
 
                 dpg.add_separator()
                 dpg.add_spacer(height=10)
@@ -1330,8 +1673,9 @@ with dpg.window(tag="Primary Window"):
                     with dpg.child_window(
                         tag="bx_container",
                         border=True,
-                        width=450,
-                        height=275
+                        width=440,
+                        height=295,
+                        no_scrollbar=True
                     ):
 
                         dpg.add_text("Bx")
@@ -1339,7 +1683,7 @@ with dpg.window(tag="Primary Window"):
                         with dpg.plot(
                             tag="bx_plot",
                             label="Bx",
-                            height=245,
+                            height=255,
                             width=-1
                         ):
 
@@ -1371,8 +1715,9 @@ with dpg.window(tag="Primary Window"):
                     with dpg.child_window(
                         tag="by_container",
                         border=True,
-                        width=450,
-                        height=275
+                        width=440,
+                        height=295,
+                        no_scrollbar=True
                     ):
 
                         dpg.add_text("By")
@@ -1380,7 +1725,7 @@ with dpg.window(tag="Primary Window"):
                         with dpg.plot(
                             tag="by_plot",
                             label="By",
-                            height=245,
+                            height=255,
                             width=-1
                         ):
 
@@ -1414,8 +1759,9 @@ with dpg.window(tag="Primary Window"):
                     with dpg.child_window(
                         tag="bz_container",
                         border=True,
-                        width=450,
-                        height=275
+                        width=440,
+                        height=295,
+                        no_scrollbar=True
                     ):
 
                         dpg.add_text("Bz")
@@ -1423,7 +1769,7 @@ with dpg.window(tag="Primary Window"):
                         with dpg.plot(
                             tag="bz_plot",
                             label="Bz",
-                            height=245,
+                            height=255,
                             width=-1
                         ):
 
@@ -1455,8 +1801,9 @@ with dpg.window(tag="Primary Window"):
                     with dpg.child_window(
                         tag="bmag_container",
                         border=True,
-                        width=450,
-                        height=275
+                        width=440,
+                        height=295,
+                        no_scrollbar=True
                     ):
 
                         dpg.add_text("|B|")
@@ -1464,7 +1811,7 @@ with dpg.window(tag="Primary Window"):
                         with dpg.plot(
                             tag="bmag_plot",
                             label="Magnetic Field Magnitude",
-                            height=245,
+                            height=255,
                             width=-1
                         ):
 
@@ -1509,6 +1856,39 @@ with dpg.window(
         wrap=300
     )
 
+
+def apply_button_themes():
+    palette = {
+        "APPLY SETPOINT": [28, 105, 135, 255],
+        "APPLY GAINS": [28, 105, 135, 255],
+        "AUTOTUNE PID": [125, 85, 35, 255],
+        "START LOGGING": [25, 105, 80, 255],
+        "Export Excel": [45, 75, 110, 255],
+        "CALIBRATE ZERO": [75, 70, 120, 255],
+    }
+    for label, color in palette.items():
+        tag = f"theme_{label.replace(' ', '_').replace('(', '').replace(')', '')}"
+        with dpg.theme() as t:
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, color)
+                dpg.add_theme_color(
+                    dpg.mvThemeCol_ButtonHovered,
+                    [min(color[0] + 25, 255), min(color[1] + 25, 255), min(color[2] + 25, 255), 255]
+                )
+                dpg.add_theme_color(
+                    dpg.mvThemeCol_ButtonActive,
+                    [min(color[0] + 40, 255), min(color[1] + 40, 255), min(color[2] + 40, 255), 255]
+                )
+        for item in dpg.get_all_items():
+            try:
+                if dpg.get_item_type(item) == "mvAppItemType::mvButton" and dpg.get_item_label(item) == label:
+                    dpg.bind_item_theme(item, t)
+            except Exception:
+                pass
+
+apply_button_themes()
+
+
 threading.Thread(
     target=websocket_worker,
     daemon=True
@@ -1520,7 +1900,6 @@ threading.Thread(
 ).start()
 
 
-#GUI updating
 
 def update_connectivity_indicator():
 
@@ -1559,7 +1938,6 @@ def update_connectivity_indicator():
 
     dpg.set_value("mode_text", connection_mode)
 
-    # Show a new error once in a small top-right popup.
     global last_reported_error
 
     if sensor_error:
@@ -1577,14 +1955,12 @@ def update_graph():
     current_time = time.time() - start_time
     factor = UNIT_FACTORS[selected_unit]
 
-    # Collect raw readings for zero calibration.
     if calibrating:
         calibration_samples.append((Bx, By, Bz))
 
         if len(calibration_samples) >= CALIBRATION_COUNT:
             finish_calibration()
 
-    # Apply the stored calibration bias.
     Bx_corrected = Bx - Bx_bias
     By_corrected = By - By_bias
     Bz_corrected = Bz - Bz_bias
@@ -1624,30 +2000,30 @@ def update_graph():
     
     if len(time_data) > 2:
 
-        x_min = max(0, current_time - 30)
+        x_max = max(30.0, current_time)
 
         dpg.set_axis_limits(
             "bx_x_axis",
-            x_min,
-            current_time
+            0.0,
+            x_max
         )
 
         dpg.set_axis_limits(
             "by_x_axis",
-            x_min,
-            current_time
+            0.0,
+            x_max
         )
 
         dpg.set_axis_limits(
             "bz_x_axis",
-            x_min,
-            current_time
+            0.0,
+            x_max
         )
 
         dpg.set_axis_limits(
             "bmag_x_axis",
-            x_min,
-            current_time
+            0.0,
+            x_max
         )
 
 
@@ -1677,45 +2053,66 @@ def update_graph():
         f"|B| : {B_magnitude_corrected * factor:.4f} {selected_unit}"
     )
 
+    if trim_voltage is not None:
+        dpg.set_value("trim_text", f"Physical trim: {trim_voltage:.3f} V")
+
+
 
 def log_data():
 
     global last_logged_time
 
-    interval = dpg.get_value(
-        "logging_interval"
-    )
+    try:
+        interval = float(
+            dpg.get_value(
+                "logging_interval"
+            )
+        )
+    except (TypeError, ValueError):
+        interval = 1.0
+
+    if interval <= 0:
+        interval = 1.0
 
     current_time = time.time()
 
-    if current_time - last_logged_time >= interval:
+    if current_time - last_logged_time < interval:
+        return
 
-        logged_data.append({
+    logged_data.append({
 
-            "time_s": round(
+        "time_s":
+            round(
                 current_time - start_time,
                 2
             ),
 
-            "Bx_G": Bx - Bx_bias,
-            "By_G": By - By_bias,
-            "Bz_G": Bz - Bz_bias,
-            "B_magnitude_G": (
-                (Bx - Bx_bias)**2 +
-                (By - By_bias)**2 +
-                (Bz - Bz_bias)**2
+        "Bx_G":
+            Bx - Bx_bias,
+
+        "By_G":
+            By - By_bias,
+
+        "Bz_G":
+            Bz - Bz_bias,
+
+        "B_magnitude_G":
+            (
+                (Bx - Bx_bias) ** 2
+                +
+                (By - By_bias) ** 2
+                +
+                (Bz - Bz_bias) ** 2
             ) ** 0.5,
 
-            "Bx_raw_G": Bx,
-            "By_raw_G": By,
-            "Bz_raw_G": Bz,
-            "B_magnitude_raw_G": B_magnitude,
+        "Bx_raw_G": Bx,
+        "By_raw_G": By,
+        "Bz_raw_G": Bz,
+        "B_magnitude_raw_G": B_magnitude,
+        "connection": connection_mode
+    })
 
-            "connection": connection_mode
-
-        })
-
-        last_logged_time = current_time
+    last_logged_time = current_time
 
 
 # GUI initilization
@@ -1744,7 +2141,6 @@ dpg.show_viewport()
 dpg.maximize_viewport()
 dpg.render_dearpygui_frame()
 
-# Keep splash visible for at least 2 seconds
 elapsed = time.time() - start_time
 minimum_splash_time = 2.0
 
@@ -1757,7 +2153,6 @@ if pyi_splash:
 
 while dpg.is_dearpygui_running():
 
-    # Detect a newly inserted Arduino and show the prompt
     if (
         connection_mode == MODE_WEBSOCKET
         and usb_candidate_port is not None
